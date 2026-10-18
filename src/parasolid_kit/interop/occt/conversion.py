@@ -32,7 +32,7 @@ from ...brep.geometry import (
     TrimmedCurve,
 )
 from ...brep.model import BrepModel
-from ...brep.topology import BodyKind, Sense, SourceNodeRef
+from ...brep.topology import BodyKind, Sense, SourceNodeRef, is_isolated_vertex_loop
 from ...diagnostics import (
     Diagnostic,
     DiagnosticKind,
@@ -179,6 +179,9 @@ def to_occt(
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as error:
+        face_diagnostics = getattr(error, "face_diagnostics", None)
+        if face_diagnostics:
+            _raise_conversion(context, face_diagnostics[0], diagnostics=face_diagnostics)
         diagnostic = _diagnostic(
             context,
             code="occt.construction_failed",
@@ -660,6 +663,7 @@ def _unsupported_diagnostics(context: _ConversionContext) -> list[Diagnostic]:
                 )
             )
     loop_half_edges = {half_edge_id for loop in model.loops for half_edge_id in loop.half_edges}
+    isolated_fins = _isolated_vertex_fin_ids(model)
     for half_edge in model.half_edges:
         if half_edge.id in loop_half_edges and half_edge.dummy:
             result.append(
@@ -672,7 +676,11 @@ def _unsupported_diagnostics(context: _ConversionContext) -> list[Diagnostic]:
                     details={"entity_kind": "half_edge", "entity_id": half_edge.id},
                 )
             )
-        if half_edge.id in loop_half_edges and half_edge.sense is Sense.UNKNOWN:
+        if (
+            half_edge.id in loop_half_edges
+            and half_edge.sense is Sense.UNKNOWN
+            and half_edge.id not in isolated_fins
+        ):
             result.append(_unknown_sense(context, "half_edge", half_edge.id, half_edge.source))
     return result
 
@@ -856,8 +864,10 @@ def _nurbs_surface_issue(definition: NurbsSurface) -> str | None:
         or definition.v_degree >= definition.v_control_vertex_count
     ):
         return "degree is outside its valid control-point range"
-    if any(len(values) != 3 for values in definition.control_vertices):
-        return "control vertices must contain exactly three coordinates"
+    if any(len(values) != definition.vertex_dimension for values in definition.control_vertices):
+        return "control vertices must match the declared dimension"
+    if definition.vertex_dimension not in (3, 4):
+        return "control vertices must contain three coordinates, or four when the surface is rational"
     if any(not isfinite(value) for values in definition.control_vertices for value in values):
         return "control vertices must be finite"
     u_issue = _nurbs_knot_issue(
@@ -1023,6 +1033,7 @@ def _reference_diagnostics(context: _ConversionContext) -> list[Diagnostic]:
         check("loop", loop.id, "face", loop.face, loop.source)
         for half_edge_id in loop.half_edges:
             check("loop", loop.id, "half_edge", half_edge_id, loop.source)
+    isolated_fins = _isolated_vertex_fin_ids(model)
     for half_edge in model.half_edges:
         check(
             "half_edge",
@@ -1038,7 +1049,7 @@ def _reference_diagnostics(context: _ConversionContext) -> list[Diagnostic]:
             "edge",
             half_edge.edge,
             half_edge.source,
-            optional=half_edge.dummy,
+            optional=half_edge.dummy or half_edge.id in isolated_fins,
         )
         check(
             "half_edge",
@@ -1151,6 +1162,17 @@ def _ocp_distribution() -> str | None:
 
 def _optional_text(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _isolated_vertex_fin_ids(model: BrepModel) -> set[int]:
+    """Fins whose loop is a legal isolated vertex, not a missing edge."""
+
+    half_edges = {item.id: item for item in model.half_edges}
+    return {
+        loop.half_edges[0]
+        for loop in model.loops
+        if is_isolated_vertex_loop(loop, half_edges)
+    }
 
 
 def _unknown_sense(

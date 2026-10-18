@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/parasolid-core", "crates/parasolid-python"]
+members = ["crates/parasolid-core", "crates/parasolid-python", "crates/parasolid-capi"]
 exclude = ["fuzz"]
 resolver = "3"
 

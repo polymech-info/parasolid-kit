@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from math import isfinite
@@ -178,6 +178,28 @@ class HalfEdge:
     sense: Sense
     dummy: bool
     source: SourceNodeRef
+
+
+def is_isolated_vertex_loop(loop: Loop, half_edges: Mapping[int, HalfEdge]) -> bool:
+    """Whether ``loop`` is one XT isolated vertex fin.
+
+    The transmit permits a loop whose only fin points at itself, carries a
+    vertex, and has no edge, curve, or partner fin. Its sense is insignificant.
+    """
+
+    if len(loop.half_edges) != 1:
+        return False
+    fin = half_edges.get(loop.half_edges[0])
+    if fin is None or fin.loop != loop.id or fin.dummy:
+        return False
+    return (
+        fin.edge is None
+        and fin.curve is None
+        and fin.other is None
+        and fin.vertex is not None
+        and fin.forward == fin.id
+        and fin.backward == fin.id
+    )
 
 
 @dataclass(frozen=True, slots=True)

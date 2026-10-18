@@ -20,7 +20,15 @@ from ...brep.geometry import (
     TorusSurface,
 )
 from ...brep.model import BrepModel
-from ...brep.topology import BodyKind, Face, HalfEdge, Sense, SourceNodeRef, Vector3
+from ...brep.topology import (
+    BodyKind,
+    Face,
+    HalfEdge,
+    Sense,
+    SourceNodeRef,
+    Vector3,
+    is_isolated_vertex_loop,
+)
 from ...diagnostics import Diagnostic
 from .geometry import GeometryFactory
 from .model import ShapeRelationKind, SourceEntityKind, SourceEntityRef
@@ -280,6 +288,18 @@ class TopologyBuilder:
             surface = self._surface_for_face(face)
             if not isinstance(surface.definition, ConeSurface):
                 continue
+            isolated = [
+                loop_id
+                for loop_id in face.loops
+                if is_isolated_vertex_loop(self.loops[loop_id], self.half_edges)
+            ]
+            if isolated:
+                edge_loops = [loop_id for loop_id in face.loops if loop_id not in isolated]
+                raise ValueError(
+                    f"cone face {face.id} has isolated vertex loop {isolated[0]} "
+                    f"and {len(edge_loops)} edge loops; the analytic builder only "
+                    "covers two periodic rings, so this face stays on the trimmed converter"
+                )
             loop_edges = [self._single_ring_edge(loop_id, face.id) for loop_id in face.loops]
             if len(loop_edges) != 2 or len(set(loop_edges)) != 2:
                 raise ValueError(

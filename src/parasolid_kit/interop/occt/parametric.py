@@ -47,17 +47,43 @@ from ...brep.geometry import (
     TorusSurface,
     TrimmedCurve,
 )
-from ...brep.topology import BodyKind, RegionKind, Sense
+from ...brep.topology import BodyKind, RegionKind, Sense, is_isolated_vertex_loop
 from ...diagnostics import Diagnostic, DiagnosticKind, DiagnosticSeverity, SourceLocation
 from .intersection import fit_intersection, intersect_analytic, project_curve
 from .model import ShapeRelationKind, SourceEntityKind
 from .topology import BuiltTopology, TopologyBuilder, _sense_sign
 
 
+def _first_failing_status(analyzer, shape) -> str:
+    """First BRepCheck status that is not NoError, searching the face then its boundary."""
+
+    for candidate in (
+        shape,
+        *subshapes(shape, TopAbs_WIRE),
+        *subshapes(shape, TopAbs_EDGE),
+        *subshapes(shape, TopAbs_VERTEX),
+    ):
+        status = analyzer.Result(candidate).Status()
+        if status.IsEmpty():
+            continue
+        name = str(status.First())
+        if "NoError" not in name:
+            return name
+    return "BRepCheck_NoError"
+
+
 def subshapes(shape: object, kind: object) -> list:
     indexed = TopTools_IndexedMapOfShape()
     TopExp.MapShapes_s(shape, kind, indexed)
     return [indexed.FindKey(i) for i in range(1, indexed.Extent() + 1)]
+
+
+class RefusedFaces(Exception):
+    """One or more source faces failed; the document was not assembled."""
+
+    def __init__(self, diagnostics: tuple[Diagnostic, ...]) -> None:
+        self.face_diagnostics = diagnostics
+        super().__init__(f"{len(diagnostics)} source faces were refused")
 
 
 class ParametricTopologyBuilder(TopologyBuilder):
@@ -86,21 +112,53 @@ class ParametricTopologyBuilder(TopologyBuilder):
         # Curves built by approximation and the deviation each one may carry.
         self.approximated_curves: dict[int, float] = {}
         self.diagnostics = []
+        self.isolated_edge_shapes: dict[int, object] = {}
 
     def build(self) -> BuiltTopology:
         self._build_vertices()
         for edge in self.model.edges:
             self._build_edge(edge)
         # All face pcurves must exist before a periodic seam splits shared rings.
+        # A refused face is recorded and skipped. Shared edges can make a later
+        # face fail because an earlier one did; the messages stay per face.
+        refused: dict[int, Exception] = {}
         for face in self.model.faces:
-            self._build_face(face)
+            try:
+                self._build_face(face)
+            except Exception as error:
+                refused[face.id] = error
+                self.face_shapes.pop(face.id, None)
         for face in self.model.faces:
-            self._finish_face(face)
+            if face.id in refused:
+                continue
+            try:
+                self._finish_face(face)
+            except Exception as error:
+                refused[face.id] = error
+                self.face_shapes.pop(face.id, None)
         for face in self.model.faces:
-            shape = TopoDS.Face_s(self.context.Apply(self.face_shapes[face.id]))
-            if not BRepCheck_Analyzer(shape).IsValid():
-                raise ValueError(f"OCCT parametric face {face.id} is invalid")
-            self.face_shapes[face.id] = shape
+            if face.id in refused:
+                continue
+            try:
+                shape = TopoDS.Face_s(self.context.Apply(self.face_shapes[face.id]))
+                analyzer = BRepCheck_Analyzer(shape)
+                if not analyzer.IsValid():
+                    raise ValueError(
+                        f"OCCT parametric face {face.id} is invalid: "
+                        f"{_first_failing_status(analyzer, shape)}"
+                    )
+                self.face_shapes[face.id] = shape
+            except Exception as error:
+                refused[face.id] = error
+                self.face_shapes.pop(face.id, None)
+        if refused:
+            findings = tuple(
+                self._refused_face_diagnostic(face, refused[face.id])
+                for face in self.model.faces
+                if face.id in refused
+            )
+            self.diagnostics.extend(findings)
+            raise RefusedFaces(findings)
         self._validate_source_boundaries()
         # The base wire builder records provisional relations; resolve them only
         # after every seam replacement has propagated to both adjacent faces.
@@ -530,10 +588,16 @@ class ParametricTopologyBuilder(TopologyBuilder):
         opposed = _sense_sign(face.sense) * _sense_sign(self.surfaces[face.surface].sense) < 0
         if opposed:
             self.operations.append("reverse_opposed_face_loops")
-        for loop_id in face.loops:
-            for half_edge_id in self.loops[loop_id].half_edges:
-                self._add_pcurve(self.half_edges[half_edge_id], shape)
-            wire = self._make_wire(loop_id)
+        isolated = [
+            self.loops[loop_id]
+            for loop_id in face.loops
+            if is_isolated_vertex_loop(self.loops[loop_id], self.half_edges)
+        ]
+        ordinary = [loop_id for loop_id in face.loops if self.loops[loop_id] not in isolated]
+        if not ordinary:
+            raise ValueError(f"parametric face {face.id} has no edge-backed trim loop")
+
+        def add_wire(wire: object) -> None:
             shift = ShapeFix_Wire(wire, shape, self.precision)
             if shift.FixShifted():
                 self.operations.append("unwrap_periodic_surface_parameters")
@@ -543,7 +607,122 @@ class ParametricTopologyBuilder(TopologyBuilder):
                 self.operations.append("insert_degenerated_singularity_edges")
             fixed = shift.Wire()
             builder.Add(shape, TopoDS.Wire_s(fixed.Reversed()) if opposed else fixed)
+
+        for loop_id in ordinary:
+            for half_edge_id in self.loops[loop_id].half_edges:
+                self._add_pcurve(self.half_edges[half_edge_id], shape)
+            add_wire(self._make_wire(loop_id))
+        for loop in isolated:
+            add_wire(self._cone_apex_wire(loop, face, shape))
+            self.operations.append("cone_isolated_vertex_boundary")
         self.face_shapes[face.id] = shape
+
+    def _cone_apex_wire(self, loop, face, shape):
+        """Degenerated edge at the cone apex, spanning the trim's U period.
+
+        The isolated fin has no curve. The cone parameterization supplies the
+        boundary: V is the apex, and U covers one full turn when the other
+        trim encircles the axis. A sector with no lateral edges is refused.
+        """
+
+        from OCP.Geom2d import Geom2d_Line
+        from OCP.ShapeAnalysis import ShapeAnalysis_Surface
+        from OCP.TopAbs import TopAbs_FORWARD, TopAbs_REVERSED
+        from OCP.TopoDS import TopoDS_Edge, TopoDS_Wire
+        from OCP.gp import gp_Dir2d, gp_Pnt2d
+
+        definition = self.surfaces[face.surface].definition
+        if not isinstance(definition, ConeSurface):
+            kind = self.surfaces[face.surface].kind.value
+            raise ValueError(
+                f"isolated vertex loop {loop.id} on {kind} face {face.id} "
+                "has no degenerate-boundary construction"
+            )
+        if abs(definition.sin_half_angle) <= 1.0e-15:
+            raise ValueError(f"cone face {face.id} has a zero half-angle sine")
+        fin = self.half_edges[loop.half_edges[0]]
+        surface = self._surface_geometry(face.surface)
+        apex_v = -(definition.radius * self.geometry.scale) / definition.sin_half_angle
+        apex = surface.Value(0.0, apex_v)
+        vertex = self.vertex_shapes[fin.vertex]
+        source_point = self.geometry.point(self.points[self.vertices[fin.vertex].point].position)
+        tolerance = max(self.precision, BRep_Tool.Tolerance_s(vertex))
+        if source_point.Distance(apex) > tolerance * 10:
+            raise ValueError(
+                f"isolated vertex {fin.vertex} on cone face {face.id} is not the cone apex"
+            )
+        period = surface.UPeriod()
+        probe = ShapeAnalysis_Surface(surface)
+        samples: list[float] = []
+        for edge in subshapes(shape, TopAbs_EDGE):
+            adaptor = BRepAdaptor_Curve(TopoDS.Edge_s(edge))
+            first, last = adaptor.FirstParameter(), adaptor.LastParameter()
+            for index in range(5):
+                point = adaptor.Value(first + (last - first) * index / 4)
+                samples.append(probe.ValueOfUV(point, tolerance).X() % period)
+        if len(samples) < 2:
+            raise ValueError(f"cone face {face.id} has no edge samples for its apex boundary")
+        ordered = sorted(samples)
+        gaps = [right - left for left, right in pairwise(ordered)]
+        gaps.append(ordered[0] + period - ordered[-1])
+        largest = max(gaps)
+        if largest > period * 0.25:
+            raise ValueError(
+                f"cone face {face.id} trim does not encircle the apex; "
+                "an isolated vertex cannot close a sector that has no lateral edges"
+            )
+        start = gaps.index(largest)
+        u0 = ordered[0] if start == len(ordered) - 1 else ordered[start + 1]
+        edge = TopoDS_Edge()
+        builder = BRep_Builder()
+        builder.MakeEdge(edge)
+        builder.UpdateEdge(
+            edge,
+            Geom2d_Line(gp_Pnt2d(u0, apex_v), gp_Dir2d(1.0, 0.0)),
+            shape,
+            tolerance,
+        )
+        builder.Range(edge, shape, 0.0, period)
+        builder.Add(edge, TopoDS.Vertex_s(vertex.Oriented(TopAbs_FORWARD)))
+        builder.Add(edge, TopoDS.Vertex_s(vertex.Oriented(TopAbs_REVERSED)))
+        builder.Degenerated(edge, True)
+        self.isolated_edge_shapes[fin.id] = edge
+        self.half_edge_shapes[fin.id] = edge
+        wire = TopoDS_Wire()
+        builder.MakeWire(wire)
+        builder.Add(wire, edge)
+        self.loop_shapes[loop.id] = wire
+        return wire
+
+    def _refused_face_diagnostic(self, face, error: Exception) -> Diagnostic:
+        surface = self.surfaces.get(face.surface)
+        kind = None if surface is None else surface.kind.value
+        node_id = face.source.node_id
+        return Diagnostic(
+            code="occt.face_refused",
+            severity=DiagnosticSeverity.ERROR,
+            kind=(
+                DiagnosticKind.UNSUPPORTED
+                if "no degenerate-boundary construction" in str(error)
+                else DiagnosticKind.INVALID
+            ),
+            fatal=True,
+            message=(
+                f"{kind or 'unknown'} face {face.id} ({len(face.loops)} loops) "
+                f"was not converted: {error}"
+            ),
+            location=SourceLocation(byte_offset=face.source.byte_range.start),
+            node_type=face.source.node_type,
+            node_id=None if node_id is None or node_id < 0 else node_id,
+            schema_key=self.model.schema_key,
+            details={
+                "entity_kind": "face",
+                "entity_id": face.id,
+                "geometry_kind": kind,
+                "loop_count": len(face.loops),
+                "exception_type": type(error).__name__,
+            },
+        )
 
     def _finish_face(self, face):
         shape = TopoDS.Face_s(self.context.Apply(self.face_shapes[face.id]))
@@ -714,11 +893,25 @@ class ParametricTopologyBuilder(TopologyBuilder):
             wire_edges = [{hash(edge) for edge in subshapes(wire, TopAbs_EDGE)} for wire in wires]
             loop_targets = []
             for loop_id in face.loops:
-                expected = {
-                    hash(edge)
-                    for hid in self.loops[loop_id].half_edges
-                    for edge in mapped_edges[self.half_edges[hid].edge]
-                }
+                loop = self.loops[loop_id]
+                if is_isolated_vertex_loop(loop, self.half_edges):
+                    fin = self.half_edges[loop.half_edges[0]]
+                    shapes = subshapes(
+                        self.context.Apply(self.isolated_edge_shapes[fin.id]),
+                        TopAbs_EDGE,
+                    )
+                    if not shapes:
+                        raise ValueError(
+                            f"isolated vertex loop {loop_id} degenerated edge disappeared"
+                        )
+                    record_many(SourceEntityKind.HALF_EDGE, fin, shapes)
+                    expected = {hash(edge) for edge in shapes}
+                else:
+                    expected = {
+                        hash(edge)
+                        for hid in loop.half_edges
+                        for edge in mapped_edges[self.half_edges[hid].edge]
+                    }
                 candidates = [i for i, values in enumerate(wire_edges) if expected <= values]
                 if len(candidates) != 1:
                     raise ValueError(

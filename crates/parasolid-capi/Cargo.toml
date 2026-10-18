@@ -1,0 +1,28 @@
+[package]
+name = "parasolid-capi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "C ABI shared library for parasolid-kit"
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "parasolid"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+parasolid-core = { path = "../parasolid-core" }
+
+# The C ABI needs unsafe. Cargo will not let a member inherit the workspace
+# lints and override that one, so the same table is copied with unsafe allowed.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+expect_used = "deny"
+panic = "deny"
+unwrap_used = "deny"
