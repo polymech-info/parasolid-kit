@@ -16,6 +16,28 @@ UNIT_TO_METRES: Final[dict[LengthUnit, float]] = {
     "ft": 0.3048,
 }
 
+# Coin's absolute chord floor is 1e-3 for shapes stored in millimetres.
+ABSOLUTE_DEFLECTION_MM: Final[float] = 1.0e-3
+
+
+def mesh_deflection(diagonal: float, working_unit: LengthUnit) -> float:
+    """Relative chord plus a physical floor converted into ``working_unit``.
+
+    ``diagonal * 0.002`` is scale-free. The absolute floor is 0.001 mm, so a
+    metre model uses 1e-6 rather than the millimetre number 1e-3.
+    """
+
+    if working_unit not in UNIT_TO_METRES:
+        supported = ", ".join(UNIT_TO_METRES)
+        raise ValueError(f"working_unit must be one of: {supported}")
+    if isinstance(diagonal, bool) or not isinstance(diagonal, (int, float)):
+        raise TypeError("diagonal must be a number")
+    span = float(diagonal)
+    if not isfinite(span) or span < 0.0:
+        raise ValueError("diagonal must be finite and non-negative")
+    floor = ABSOLUTE_DEFLECTION_MM * UNIT_TO_METRES["mm"] / UNIT_TO_METRES[working_unit]
+    return max(span * 0.002, floor)
+
 
 @dataclass(frozen=True, slots=True)
 class ValidationTolerances:

@@ -9,12 +9,12 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from itertools import pairwise
-from math import isfinite
+from math import copysign, isfinite, pi
 
 from OCP.BRep import BRep_Builder, BRep_Tool
-from OCP.BRepAdaptor import BRepAdaptor_Curve
+from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Curve2d
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeSolid
-from OCP.BRepCheck import BRepCheck_Analyzer
+from OCP.BRepCheck import BRepCheck_Analyzer, BRepCheck_ListOfStatus
 from OCP.BRepLib import BRepLib
 from OCP.BSplCLib import BSplCLib
 from OCP.Precision import Precision
@@ -54,8 +54,58 @@ from .model import ShapeRelationKind, SourceEntityKind
 from .topology import BuiltTopology, TopologyBuilder, _sense_sign
 
 
+def _period_shift(delta: float, period: float | None, tolerance: float) -> float:
+    """Move ``delta`` by whole periods when the remainder is only numerical noise."""
+
+    if period is None or period <= 0.0:
+        return 0.0
+    turns = round(delta / period)
+    if turns == 0:
+        return 0.0
+    if abs(delta - turns * period) > tolerance:
+        return 0.0
+    return -turns * period
+
+
+def _oriented_uv(edge, face) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Pcurve ends in the edge orientation used by the wire.
+
+    ``BRepAdaptor_Curve2d`` reports the stored parameter direction. A reversed
+    fin walks that curve from its last parameter back to its first.
+    """
+
+    curve = BRepAdaptor_Curve2d(edge, face)
+    start = curve.Value(curve.FirstParameter())
+    end = curve.Value(curve.LastParameter())
+    if int(edge.Orientation()) == int(TopAbs_REVERSED):
+        return (end.X(), end.Y()), (start.X(), start.Y())
+    return (start.X(), start.Y()), (end.X(), end.Y())
+
+
+def _translate_pcurve(curve, du: float, dv: float):
+    if du == 0.0 and dv == 0.0:
+        return curve
+    from OCP.gp import gp_Vec2d
+
+    return curve.Translated(gp_Vec2d(du, dv))
+
+
+def _status_names(status) -> list[str]:
+    """Every status in an OCCT list. The first entry is often NoError."""
+
+    if status.IsEmpty():
+        return []
+    copy = BRepCheck_ListOfStatus()
+    copy.Assign(status)
+    names = []
+    while not copy.IsEmpty():
+        names.append(str(copy.First()))
+        copy.RemoveFirst()
+    return names
+
+
 def _first_failing_status(analyzer, shape) -> str:
-    """First BRepCheck status that is not NoError, searching the face then its boundary."""
+    """First failing BRepCheck status, including a status recorded on a parent shape."""
 
     for candidate in (
         shape,
@@ -63,13 +113,52 @@ def _first_failing_status(analyzer, shape) -> str:
         *subshapes(shape, TopAbs_EDGE),
         *subshapes(shape, TopAbs_VERTEX),
     ):
-        status = analyzer.Result(candidate).Status()
-        if status.IsEmpty():
-            continue
-        name = str(status.First())
-        if "NoError" not in name:
-            return name
+        result = analyzer.Result(candidate)
+        for name in _status_names(result.Status()):
+            if "NoError" not in name:
+                return name
+        result.InitContextIterator()
+        while result.MoreShapeInContext():
+            for name in _status_names(result.StatusOnShape()):
+                if "NoError" not in name:
+                    return name
+            result.NextShapeInContext()
     return "BRepCheck_NoError"
+
+
+def boundary_census(shape: object) -> dict[str, int]:
+    """Classify shell edges by use, without treating a same-face seam as a hole.
+
+    A periodic seam is one edge used twice by the same face. A degenerated edge
+    closes a singularity. A free boundary is a single non-degenerated use.
+    """
+
+    groups: list[dict[str, object]] = []
+    for face_index, face_shape in enumerate(subshapes(shape, TopAbs_FACE)):
+        for edge_shape in subshapes(face_shape, TopAbs_EDGE):
+            edge = TopoDS.Edge_s(edge_shape)
+            group = next((item for item in groups if item["edge"].IsSame(edge)), None)
+            if group is None:
+                group = {
+                    "edge": edge,
+                    "faces": set(),
+                    "uses": 0,
+                    "degenerated": bool(BRep_Tool.Degenerated_s(edge)),
+                }
+                groups.append(group)
+            group["faces"].add(face_index)
+            group["uses"] += 1
+    counts = {"free": 0, "seam": 0, "degenerated": 0, "shared": 0, "edges": len(groups)}
+    for group in groups:
+        if group["degenerated"]:
+            counts["degenerated"] += 1
+        elif len(group["faces"]) >= 2:
+            counts["shared"] += 1
+        elif group["uses"] >= 2:
+            counts["seam"] += 1
+        else:
+            counts["free"] += 1
+    return counts
 
 
 def subshapes(shape: object, kind: object) -> list:
@@ -112,6 +201,7 @@ class ParametricTopologyBuilder(TopologyBuilder):
         # Curves built by approximation and the deviation each one may carry.
         self.approximated_curves: dict[int, float] = {}
         self.diagnostics = []
+        self.rendered_bodies: list[tuple[int, object, bool]] = []
         self.isolated_edge_shapes: dict[int, object] = {}
 
     def build(self) -> BuiltTopology:
@@ -136,6 +226,11 @@ class ParametricTopologyBuilder(TopologyBuilder):
             except Exception as error:
                 refused[face.id] = error
                 self.face_shapes.pop(face.id, None)
+        # A later periodic face can replace a shared edge in the reshape context.
+        # The replacement keeps both curve representations, but ShapeFix's copy
+        # leaves SameParameter and SameRange inconsistent. Set the flags only
+        # where those representations already agree.
+        self._reconcile_parameter_flags()
         for face in self.model.faces:
             if face.id in refused:
                 continue
@@ -526,9 +621,13 @@ class ParametricTopologyBuilder(TopologyBuilder):
 
     def _edge_for_half_edge(self, half_edge):
         edge = self.edges[half_edge.edge]
-        if half_edge.vertex is None:
+        closed = edge.start_vertex is not None and edge.start_vertex == edge.end_vertex
+        if half_edge.vertex is None or closed:
             if edge.curve is None:
                 raise ValueError(f"half-edge {half_edge.id} has no orientation reference")
+            # A closed curve names the same vertex at both ends, so the fin
+            # sense is the only direction. Comparing the vertex first would
+            # always walk the curve forward.
             forward = half_edge.sense is self.curves[edge.curve].sense
         elif half_edge.vertex == edge.end_vertex:
             forward = True
@@ -542,9 +641,182 @@ class ParametricTopologyBuilder(TopologyBuilder):
             self.edge_shapes[edge.id].Oriented(TopAbs_FORWARD if forward else TopAbs_REVERSED)
         )
 
+    def _analytic_sphere_pcurve(self, edge, face) -> bool:
+        """Map a 3D curve onto a sphere by inverse parameters, not by projection.
+
+        ``ElSLib.Parameters`` is the sphere's own inverse. The fitted pcurve is
+        kept only when ``SphereValue`` reproduces the 3D curve over the whole
+        trim. A miss raises, so ``FixMissingSeam`` never repairs a bad pcurve.
+        """
+
+        from OCP.BRepAdaptor import BRepAdaptor_Surface
+        from OCP.ElSLib import ElSLib
+        from OCP.Geom2d import Geom2d_BSplineCurve
+        from OCP.Geom2dAPI import Geom2dAPI_Interpolate
+        from OCP.GeomAbs import GeomAbs_Sphere
+        from OCP.gp import gp_Pnt2d
+        from OCP.TColgp import TColgp_Array1OfPnt2d, TColgp_HArray1OfPnt2d
+        from OCP.TColStd import TColStd_Array1OfInteger, TColStd_Array1OfReal, TColStd_HArray1OfReal
+
+        adaptor = BRepAdaptor_Surface(face)
+        if adaptor.GetType() != GeomAbs_Sphere:
+            return False
+        sphere = adaptor.Sphere()
+        frame = sphere.Position()
+        radius = sphere.Radius()
+        curve = BRepAdaptor_Curve(edge)
+        first = curve.FirstParameter()
+        last = curve.LastParameter()
+        if not isfinite(first) or not isfinite(last) or last <= first:
+            raise ValueError("sphere edge has a non-finite parameter interval")
+
+        def sample(count: int):
+            rows = []
+            previous_u = None
+            roundtrip = 0.0
+            for index in range(count):
+                parameter = first + (last - first) * index / (count - 1)
+                original = curve.Value(parameter)
+                u, v = ElSLib.Parameters_s(sphere, original)
+                if abs(abs(v) - pi / 2) <= 1.0e-8:
+                    u = 0.0 if previous_u is None else previous_u
+                elif previous_u is not None:
+                    while u - previous_u > pi:
+                        u -= 2 * pi
+                    while previous_u - u > pi:
+                        u += 2 * pi
+                previous_u = u
+                reconstructed = ElSLib.SphereValue_s(u, v, frame, radius)
+                roundtrip = max(roundtrip, original.Distance(reconstructed))
+                rows.append((parameter, u, v))
+            return rows, roundtrip
+
+        def deviation(fitted_curve, checks: int) -> float:
+            fitted_error = 0.0
+            for index in range(checks):
+                parameter = first + (last - first) * index / (checks - 1)
+                uv = fitted_curve.Value(parameter)
+                reconstructed = ElSLib.SphereValue_s(uv.X(), uv.Y(), frame, radius)
+                fitted_error = max(fitted_error, curve.Value(parameter).Distance(reconstructed))
+            return fitted_error
+
+        def polyline(rows):
+            pole_count = len(rows)
+            poles = TColgp_Array1OfPnt2d(1, pole_count)
+            knots = TColStd_Array1OfReal(1, pole_count)
+            mults = TColStd_Array1OfInteger(1, pole_count)
+            previous = None
+            for index, (parameter, u, v) in enumerate(rows, 1):
+                if previous is not None and parameter <= previous:
+                    parameter = previous + 1.0e-12
+                poles.SetValue(index, gp_Pnt2d(u, v))
+                knots.SetValue(index, parameter)
+                mults.SetValue(index, 2 if index in (1, pole_count) else 1)
+                previous = parameter
+            return Geom2d_BSplineCurve(poles, knots, mults, 1, False)
+
+        def latitude(rows):
+            return polyline((rows[0], rows[-1]))
+
+        def cross_pole(rows, bridge: float):
+            """A meridian reaches V = ±π/2 and leaves with U shifted by π.
+
+            The two sphere points are the same pole. The pcurve stays on that
+            pole for a short parameter interval, then follows the outgoing
+            meridian. A straight segment across the U jump leaves the circle.
+            """
+
+            built = [rows[0]]
+            for parameter, u, v in rows[1:]:
+                previous_t, previous_u, previous_v = built[-1]
+                near_pole = max(abs(previous_v), abs(v)) > pi / 2 - 0.2
+                if abs(u - previous_u) > pi / 2 and near_pole:
+                    pole_v = copysign(pi / 2, previous_v if abs(previous_v) >= abs(v) else v)
+                    joined = min(previous_t + bridge, parameter - bridge)
+                    if joined <= previous_t:
+                        joined = (previous_t + parameter) * 0.5
+                    if abs(previous_v - pole_v) > 1.0e-8:
+                        built.append((max(previous_t, joined - bridge), previous_u, pole_v))
+                    built.append((joined, u, pole_v))
+                built.append((parameter, u, v))
+            return built
+
+        def interpolate(rows):
+            pole_count = len(rows)
+            poles = TColgp_HArray1OfPnt2d(1, pole_count)
+            parameters = TColStd_HArray1OfReal(1, pole_count)
+            for index, (parameter, u, v) in enumerate(rows, 1):
+                poles.SetValue(index, gp_Pnt2d(u, v))
+                parameters.SetValue(index, parameter)
+            operation = Geom2dAPI_Interpolate(poles, parameters, False, Precision.Confusion_s())
+            operation.Perform()
+            if not operation.IsDone():
+                raise ValueError("sphere pcurve interpolation failed; FixMissingSeam was not run")
+            return operation.Curve()
+
+        samples, roundtrip = sample(33)
+        limit = max(BRep_Tool.Tolerance_s(edge), Precision.Confusion_s())
+        if roundtrip > limit:
+            raise ValueError(
+                f"sphere inverse misses the 3D curve by {roundtrip:.6e} "
+                f"(limit {limit:.6e}); FixAddPCurve was not used"
+            )
+        bridge = min((last - first) * 1.0e-8, 0.2 * limit / max(radius, 1.0e-9))
+        bridge = max(bridge, 1.0e-12)
+        v_span = max(row[2] for row in samples) - min(row[2] for row in samples)
+        u_steps = [samples[index][1] - samples[index - 1][1] for index in range(1, len(samples))]
+        monotone = all(step >= -1.0e-9 for step in u_steps) or all(step <= 1.0e-9 for step in u_steps)
+        crosses_pole = any(abs(step) > pi / 2 for step in u_steps)
+        pcurve = None
+        fitted = limit + 1.0
+        if v_span <= 1.0e-8 and monotone and abs(samples[-1][1] - samples[0][1]) > 1.0e-8:
+            pcurve = latitude(samples)
+            fitted = deviation(pcurve, 65)
+        elif crosses_pole:
+            count = 33
+            while fitted > limit and count <= 1025:
+                if count != 33:
+                    samples, denser_roundtrip = sample(count)
+                    roundtrip = max(roundtrip, denser_roundtrip)
+                    if roundtrip > limit:
+                        raise ValueError(
+                            f"sphere inverse misses the 3D curve by {roundtrip:.6e} "
+                            f"(limit {limit:.6e}); FixAddPCurve was not used"
+                        )
+                pcurve = polyline(cross_pole(samples, bridge))
+                fitted = deviation(pcurve, max(65, count * 4))
+                count = count * 2 - 1
+        count = 33
+        while fitted > limit and count <= 1025 and not crosses_pole:
+            if count != 33:
+                samples, denser_roundtrip = sample(count)
+                roundtrip = max(roundtrip, denser_roundtrip)
+                if roundtrip > limit:
+                    raise ValueError(
+                        f"sphere inverse misses the 3D curve by {roundtrip:.6e} "
+                        f"(limit {limit:.6e}); FixAddPCurve was not used"
+                    )
+            pcurve = interpolate(samples)
+            fitted = deviation(pcurve, max(65, count * 4))
+            count = count * 2 - 1
+        if pcurve is None or fitted > limit:
+            raise ValueError(
+                f"fitted sphere pcurve misses the 3D curve by {fitted:.6e} "
+                f"(inverse {roundtrip:.6e}, limit {limit:.6e}); FixMissingSeam was not run"
+            )
+        builder = BRep_Builder()
+        builder.UpdateEdge(edge, pcurve, face, BRep_Tool.Tolerance_s(edge))
+        builder.Range(edge, face, first, last)
+        builder.SameRange(edge, True)
+        builder.SameParameter(edge, True)
+        self.operations.append("analytic_sphere_parameters")
+        return True
+
     def _add_pcurve(self, half_edge, face):
         shape = self.edge_shapes[half_edge.edge]
         trimmed = self._surface_trim(half_edge.curve)
+        if trimmed is None and self._analytic_sphere_pcurve(shape, face):
+            return
         if trimmed is None:
             ShapeFix_Edge().FixAddPCurve(shape, face, False, self.precision)
             self.operations.append("project_3d_curve_to_surface_parameters")
@@ -597,7 +869,7 @@ class ParametricTopologyBuilder(TopologyBuilder):
         if not ordinary:
             raise ValueError(f"parametric face {face.id} has no edge-backed trim loop")
 
-        def add_wire(wire: object) -> None:
+        def add_wire(wire: object, *, reverse: bool) -> None:
             shift = ShapeFix_Wire(wire, shape, self.precision)
             if shift.FixShifted():
                 self.operations.append("unwrap_periodic_surface_parameters")
@@ -606,16 +878,100 @@ class ParametricTopologyBuilder(TopologyBuilder):
             if shift.FixDegenerated():
                 self.operations.append("insert_degenerated_singularity_edges")
             fixed = shift.Wire()
-            builder.Add(shape, TopoDS.Wire_s(fixed.Reversed()) if opposed else fixed)
+            builder.Add(shape, TopoDS.Wire_s(fixed.Reversed()) if reverse else fixed)
 
         for loop_id in ordinary:
             for half_edge_id in self.loops[loop_id].half_edges:
                 self._add_pcurve(self.half_edges[half_edge_id], shape)
-            add_wire(self._make_wire(loop_id))
+            # Seam pcurves are placed for the wire that is added. An opposed
+            # face used to reverse that wire afterwards, which swaps the two
+            # sides of a periodic seam.
+            add_wire(self._make_parametric_wire(loop_id, shape, opposed=opposed), reverse=False)
         for loop in isolated:
-            add_wire(self._cone_apex_wire(loop, face, shape))
+            add_wire(self._cone_apex_wire(loop, face, shape), reverse=opposed)
             self.operations.append("cone_isolated_vertex_boundary")
         self.face_shapes[face.id] = shape
+
+    def _make_parametric_wire(self, loop_id, face_shape, *, opposed: bool = False):
+        """Wire in loop order, with a second pcurve on a periodic seam edge.
+
+        Parasolid stores the cut of a cylinder, cone, or torus as one edge used
+        by two fins of the same face. Those fins are the two sides of the
+        parameter period. One pcurve cannot occupy both sides, and a wire
+        builder that drops the second fin leaves the face unorientable.
+        """
+
+        from OCP.TopoDS import TopoDS_Wire
+
+        loop = self.loops[loop_id]
+        surface = BRep_Tool.Surface_s(face_shape)
+        period_u = surface.UPeriod() if surface.IsUPeriodic() else None
+        period_v = surface.VPeriod() if surface.IsVPeriodic() else None
+        tolerance = max(self.precision, 1.0e-7)
+        wire = TopoDS_Wire()
+        builder = BRep_Builder()
+        builder.MakeWire(wire)
+        previous = None
+        first_use: dict[int, bool] = {}
+        half_edge_ids = tuple(reversed(loop.half_edges)) if opposed else loop.half_edges
+        for half_edge_id in half_edge_ids:
+            half_edge = self.half_edges[half_edge_id]
+            oriented = self._edge_for_half_edge(half_edge)
+            if opposed:
+                oriented = TopoDS.Edge_s(oriented.Reversed())
+            bare = TopoDS.Edge_s(oriented.Oriented(TopAbs_FORWARD))
+            start, end = _oriented_uv(oriented, face_shape)
+            if previous is not None:
+                shift_u = _period_shift(start[0] - previous[0], period_u, tolerance)
+                shift_v = _period_shift(start[1] - previous[1], period_v, tolerance)
+                if shift_u or shift_v or half_edge.edge in first_use:
+                    self._place_pcurve(
+                        bare,
+                        face_shape,
+                        shift_u,
+                        shift_v,
+                        forward=int(oriented.Orientation()) == int(TopAbs_FORWARD),
+                        seam=half_edge.edge in first_use,
+                    )
+                    start, end = _oriented_uv(oriented, face_shape)
+                    if shift_u or shift_v:
+                        self.operations.append("unwrap_periodic_surface_parameters")
+            first_use.setdefault(half_edge.edge, True)
+            builder.Add(wire, oriented)
+            self.half_edge_shapes[half_edge.id] = oriented
+            self._record(
+                SourceEntityKind.HALF_EDGE,
+                half_edge.id,
+                half_edge.source,
+                oriented,
+            )
+            previous = end
+        wire.Closed(True)
+        self.loop_shapes[loop.id] = wire
+        self._record(SourceEntityKind.LOOP, loop.id, loop.source, wire)
+        return wire
+
+    def _place_pcurve(self, edge, face_shape, shift_u, shift_v, *, forward: bool, seam: bool):
+        stored = BRep_Tool.CurveOnSurface_s(edge, face_shape, 0.0, 0.0)
+        moved = _translate_pcurve(stored, shift_u, shift_v)
+        tolerance = BRep_Tool.Tolerance_s(edge)
+        if not seam:
+            BRep_Builder().UpdateEdge(edge, moved, face_shape, tolerance)
+            return
+        # The stored curve is the edge's forward pcurve. The other side of the
+        # period belongs to whichever fin is being placed now.
+        if forward:
+            forward_curve, reversed_curve = moved, stored
+        else:
+            forward_curve, reversed_curve = stored, moved
+        BRep_Builder().UpdateEdge(
+            edge,
+            forward_curve,
+            reversed_curve,
+            face_shape,
+            tolerance,
+        )
+        self.operations.append("periodic_seam_pcurve")
 
     def _cone_apex_wire(self, loop, face, shape):
         """Degenerated edge at the cone apex, spanning the trim's U period.
@@ -751,6 +1107,75 @@ class ParametricTopologyBuilder(TopologyBuilder):
         self.face_shapes[face.id] = TopoDS.Face_s(
             self._orient_shape(shape, face.sense, self.surfaces[face.surface].sense)
         )
+
+    def _representations_agree(self, edge, samples: int = 32) -> bool:
+        """Whether every pcurve matches the 3D curve on the same parameter interval."""
+
+        curves = edge.TShape().Curves()
+        pending = type(curves)()
+        pending.Assign(curves)
+        curve3d = None
+        pcurves = []
+        while not pending.IsEmpty():
+            representation = pending.First()
+            pending.RemoveFirst()
+            if representation.IsCurve3D() and representation.Curve3D() is not None:
+                curve3d = representation
+            elif representation.IsCurveOnSurface() and representation.PCurve() is not None:
+                pcurves.append((representation, representation.PCurve(), representation.Surface()))
+                if representation.IsCurveOnClosedSurface() and representation.PCurve2() is not None:
+                    pcurves.append((representation, representation.PCurve2(), representation.Surface()))
+        if curve3d is None or not pcurves:
+            return False
+        first, last = curve3d.First(), curve3d.Last()
+        located = curve3d.Curve3D()
+        if not curve3d.Location().IsIdentity():
+            located = located.Transformed(curve3d.Location().Transformation())
+        limit = BRep_Tool.Tolerance_s(edge) + Precision.Confusion_s()
+        for representation, pcurve, surface in pcurves:
+            if abs(representation.First() - first) > 1.0e-7 or abs(representation.Last() - last) > 1.0e-7:
+                return False
+            if surface is None:
+                return False
+            if not representation.Location().IsIdentity():
+                surface = surface.Transformed(representation.Location().Transformation())
+            for index in range(samples + 1):
+                parameter = first + (last - first) * index / samples
+                uv = pcurve.Value(parameter)
+                if located.Value(parameter).Distance(surface.Value(uv.X(), uv.Y())) > limit:
+                    return False
+        return True
+
+    def _reconcile_parameter_flags(self) -> None:
+        builder = BRep_Builder()
+        changed = False
+        for face in self.model.faces:
+            if face.id not in self.face_shapes:
+                continue
+            shape = TopoDS.Face_s(self.context.Apply(self.face_shapes[face.id]))
+            for candidate in subshapes(shape, TopAbs_EDGE):
+                edge = TopoDS.Edge_s(candidate)
+                if BRep_Tool.Degenerated_s(edge):
+                    continue
+                if BRep_Tool.SameParameter_s(edge) and BRep_Tool.SameRange_s(edge):
+                    continue
+                if not self._representations_agree(edge):
+                    # A periodic copy can sit one turn away from the 3D range.
+                    # SameRange brings that copy onto the 3D interval; keep the
+                    # flag clear when the curves still do not meet.
+                    if BRep_Tool.SameRange_s(edge):
+                        continue
+                    BRepLib.SameRange_s(edge, Precision.Confusion_s())
+                    if not self._representations_agree(edge):
+                        continue
+                if not BRep_Tool.SameRange_s(edge):
+                    builder.SameRange(edge, True)
+                    changed = True
+                if not BRep_Tool.SameParameter_s(edge):
+                    builder.SameParameter(edge, True)
+                    changed = True
+        if changed:
+            self.operations.append("reconcile_shared_edge_parameters")
 
     def _validate_source_boundaries(self):
         # Sample the original FIN geometry, independently of the reparameterized
@@ -900,18 +1325,47 @@ class ParametricTopologyBuilder(TopologyBuilder):
                         self.context.Apply(self.isolated_edge_shapes[fin.id]),
                         TopAbs_EDGE,
                     )
-                    if not shapes:
+                    expected = {hash(edge) for edge in shapes}
+                    candidates = [
+                        i for i, values in enumerate(wire_edges) if expected and expected <= values
+                    ]
+                    if len(candidates) != 1:
+                        # Seam construction can replace the apex edge. The fin
+                        # still denotes the degenerated boundary on this face.
+                        candidates = [
+                            i
+                            for i, wire in enumerate(wires)
+                            if any(
+                                BRep_Tool.Degenerated_s(TopoDS.Edge_s(edge))
+                                for edge in subshapes(wire, TopAbs_EDGE)
+                            )
+                        ]
+                        if len(candidates) == 1:
+                            shapes = [
+                                edge
+                                for edge in subshapes(wires[candidates[0]], TopAbs_EDGE)
+                                if BRep_Tool.Degenerated_s(TopoDS.Edge_s(edge))
+                            ]
+                    if len(candidates) != 1 or not shapes:
                         raise ValueError(
                             f"isolated vertex loop {loop_id} degenerated edge disappeared"
                         )
                     record_many(SourceEntityKind.HALF_EDGE, fin, shapes)
-                    expected = {hash(edge) for edge in shapes}
+                    loop_targets.append((loop_id, candidates[0]))
+                    continue
                 else:
                     expected = {
                         hash(edge)
                         for hid in loop.half_edges
                         for edge in mapped_edges[self.half_edges[hid].edge]
                     }
+                    # A shared edge split by a neighbouring seam is replaced by
+                    # several edges. Only the pieces that remain on this face
+                    # identify its wire; the others belong to the neighbour.
+                    on_face = set().union(*wire_edges)
+                    present = expected & on_face
+                    if present:
+                        expected = present
                 candidates = [i for i, values in enumerate(wire_edges) if expected <= values]
                 if len(candidates) != 1:
                     raise ValueError(
@@ -937,8 +1391,36 @@ class ParametricTopologyBuilder(TopologyBuilder):
                             "periodic seam or split-boundary vertex",
                         )
 
+    def _open_shell_diagnostic(self, shell, census: dict[str, int]) -> Diagnostic:
+        return Diagnostic(
+            code="occt.solid_not_closed",
+            severity=DiagnosticSeverity.ERROR,
+            kind=DiagnosticKind.INVALID,
+            fatal=True,
+            message=(
+                f"shell {shell.id} stays an open shell: {census['free']} free boundaries, "
+                f"{census['seam']} seam edges, {census['degenerated']} degenerated edges"
+            ),
+            location=SourceLocation(byte_offset=shell.source.byte_range.start),
+            node_type=shell.source.node_type,
+            node_id=(
+                None
+                if shell.source.node_id is None or shell.source.node_id < 0
+                else shell.source.node_id
+            ),
+            schema_key=self.model.schema_key,
+            details={
+                "shell_id": shell.id,
+                "free_boundaries": census["free"],
+                "seam_edges": census["seam"],
+                "degenerated_edges": census["degenerated"],
+                "shared_edges": census["shared"],
+            },
+        )
+
     def _build_bodies(self):
         results = []
+        self.rendered_bodies = []
         for body in self.model.bodies:
             regions = [self.regions[i] for i in body.regions]
             material = [r for r in regions if r.kind is RegionKind.SOLID]
@@ -946,8 +1428,11 @@ class ParametricTopologyBuilder(TopologyBuilder):
                 material = regions
             shell_shapes = {}
             solids = []
+            body_open = False
             for region in material:
                 solid = BRepBuilderAPI_MakeSolid()
+                region_shells = []
+                region_open = False
                 for shell_id in region.shells:
                     shell = self.shells[shell_id]
                     faces = frozenset((*shell.back_faces, *shell.front_faces))
@@ -958,15 +1443,33 @@ class ParametricTopologyBuilder(TopologyBuilder):
                     builder.MakeShell(shape)
                     for face_id in sorted(faces):
                         builder.Add(shape, self.face_shapes[face_id])
-                    if body.kind is BodyKind.SOLID and not BRep_Tool.IsClosed_s(shape):
-                        raise ValueError(f"shell {shell_id} is not closed")
                     if faces in shell_shapes:
                         raise ValueError("material regions repeat the same boundary shell")
                     shell_shapes[faces] = shape
-                    solid.Add(shape)
-                    if body.kind is BodyKind.SHEET:
+                    region_shells.append((shell, shape))
+                    if body.kind is BodyKind.SOLID and not BRep_Tool.IsClosed_s(shape):
+                        region_open = True
+                        census = boundary_census(shape)
+                        self.diagnostics.append(
+                            self._open_shell_diagnostic(shell, census)
+                        )
+                        self.operations.append("open_shell_retained")
+                    else:
+                        solid.Add(shape)
+                if body.kind is BodyKind.SHEET or region_open:
+                    body_open = body_open or region_open
+                    for _shell, shape in region_shells:
                         solids.append((region.id, shape))
-                if body.kind is BodyKind.SOLID:
+                    if region_open:
+                        self._record(
+                            SourceEntityKind.REGION,
+                            region.id,
+                            region.source,
+                            region_shells[0][1],
+                            ShapeRelationKind.SPLIT,
+                            "open shell; solid conversion failed",
+                        )
+                elif body.kind is BodyKind.SOLID:
                     if not solid.IsDone():
                         raise ValueError(f"region {region.id} solid construction failed")
                     region_shape = solid.Solid()
@@ -999,6 +1502,7 @@ class ParametricTopologyBuilder(TopologyBuilder):
                             "source region boundary",
                         )
             self._record(SourceEntityKind.BODY, body.id, body.source, body_shape)
+            self.rendered_bodies.append((body.id, body_shape, body_open))
             results.append((body.id, body_shape))
         self.operations.append("solid_with_source_region_shells")
         return results

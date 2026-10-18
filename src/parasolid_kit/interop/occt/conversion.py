@@ -107,6 +107,12 @@ def to_occt(
             builder_type = ParametricTopologyBuilder
         built = builder_type(brep, GeometryFactory(options)).build()
         context.diagnostics.extend(built.diagnostics)
+        open_shell = next(
+            (item for item in built.diagnostics if item.code == "occt.solid_not_closed"),
+            None,
+        )
+        if open_shell is not None:
+            raise OcctConversionError(open_shell, report=context.report())
         if len(context.diagnostics) > limits.max_diagnostics:
             _raise_conversion(
                 context,
