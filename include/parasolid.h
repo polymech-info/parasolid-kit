@@ -17,6 +17,32 @@
  *   min > max means the body has no bounds
  *   then u32 instance_count, and each instance: u32 body ordinal, i32 node_id,
  *   16 f32 Coin matrix (axis columns, translation in the last row)
+ *   When some instances could not be placed, those records are followed by
+ *   u32 unplaced_count, then each unplaced body: u32 body ordinal, i32 node_id.
+ *   An unplaced body is kept, at identity, and is not a positioned assembly copy.
+ *
+ * parasolid_mesh returns PARASOLID_PARTIAL when the buffer is drawable but a
+ * face, transform, or limit was recovered locally. *out_err then holds the
+ * short report and *out_bytes is still the mesh. PARASOLID_OK means nothing
+ * was omitted, unplaced, or approximated.
+ *
+ * parasolid_view returns the same placement trailer, but each body is faces
+ * instead of a finished triangle soup. The native viewer builds planes,
+ * cylinders, cones, spheres, tori, NURBS, offsets, spun surfaces, and
+ * rolling-ball blends in OCCT and meshes those. Kind 0 keeps the stitch
+ * triangles already stored on that face. Magic is 'PSF2' (0x32465350), version 1:
+ *
+ *   u32 magic, version, flags, body_count
+ *   each body: u32 ordinal, u32 kind, i32 node_id, u32 face_count
+ *   each face: u32 surface_kind (0 other, 1 plane, 2 cylinder, 3 cone,
+ *              4 sphere, 5 torus, 6 nurbs, 7 offset, 8 spun, 9 rolling-ball),
+ *              u32 sense (1 reverses the surface normal),
+ *              f64 param[16], then the kind's extra block, u32 loop_count,
+ *              each loop: u32 point_count, f32 xyz * point_count,
+ *              u32 stitch_triangle_count, then the PSM triangle layout
+ *   Plane param: point, normal, x axis. Cylinder: point, axis, x axis, radius.
+ *   Cone adds sin and cos of the half angle after the radius.
+ *   Sphere: center, radius, axis, x axis. Torus: center, axis, major, minor, x axis.
  */
 
 #include <stddef.h>
@@ -39,7 +65,9 @@ enum {
     PARASOLID_LIMIT = 3,
     PARASOLID_IO = 4,
     PARASOLID_PANIC = 5,
-    PARASOLID_INVALID = 6
+    PARASOLID_INVALID = 6,
+    /* Mesh bytes are present. *out_err is the partial report. */
+    PARASOLID_PARTIAL = 7
 };
 
 /* 0 is "detect" for the bytes/path readers, and "not recognized" for the
@@ -74,9 +102,11 @@ PARASOLID_API int parasolid_summary(
 PARASOLID_API int parasolid_summary_bytes(
     const uint8_t* bytes, size_t len, int format, char** out_json, char** out_err);
 
-/* Mesh bytes are freed with parasolid_bytes_free. out_size is required.
- * out_bytes and out_err follow the same null-on-failure rule as the JSON calls. */
+/* Mesh bytes are freed with parasolid_bytes_free. out_bytes and out_size are
+ * both required. out_err may be NULL. PARASOLID_PARTIAL still writes the mesh. */
 PARASOLID_API int parasolid_mesh(
+    const char* path, uint8_t** out_bytes, size_t* out_size, char** out_err);
+PARASOLID_API int parasolid_view(
     const char* path, uint8_t** out_bytes, size_t* out_size, char** out_err);
 PARASOLID_API int parasolid_mesh_bytes(
     const uint8_t* bytes, size_t len, int format, uint8_t** out_bytes, size_t* out_size, char** out_err);

@@ -1,6 +1,6 @@
-//! Preview tessellation for the native viewer. Planar faces keep their boundary.
-//! Two-loop faces (walls, cones, fillets) are stitched along the trim curves.
-//! A spherical face is the boundary disk pushed out onto the sphere.
+//! Preview geometry for the native viewer. `view_scene` hands analytic surfaces
+//! and their trim loops to the C++ mesher. The stitch triangles travel with each
+//! face and are drawn only when that face cannot be built.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -9,7 +9,8 @@
 )]
 
 use parasolid_core::brep::{
-    Body, BodyKind, BrepId, BrepModel, CurveGeometry, CurveKind, Sense, SurfaceKind, Vector3,
+    Body, BodyKind, BrepId, BrepModel, CurveGeometry, CurveKind, NurbsCurve, NurbsSurface, Sense,
+    SurfaceKind, Vector3,
 };
 
 const MAGIC: u32 = 0x314D_5350;
@@ -29,14 +30,46 @@ pub(crate) struct Placement {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn tessellate(model: &BrepModel) -> Result<Vec<u8>, String> {
-    tessellate_placed(model, &[])
+pub(crate) struct DrawnMesh {
+    pub bytes: Vec<u8>,
+    pub faces_approximated: u32,
+    pub faces_omitted: u32,
+    pub bodies_rendered: u32,
+    pub bodies_total: u32,
+    pub truncated: bool,
 }
 
-pub(crate) fn tessellate_placed(model: &BrepModel, placements: &[Placement]) -> Result<Vec<u8>, String> {
+pub(crate) struct MeshRequest<'a> {
+    pub placements: &'a [Placement],
+    pub unplaced: &'a [Placement],
+    /// No assembly instances were present, so each body is a part at the origin.
+    pub standalone: bool,
+}
+
+#[cfg(test)]
+pub(crate) fn tessellate(model: &BrepModel) -> Result<Vec<u8>, String> {
+    Ok(tessellate_placed(
+        model,
+        &MeshRequest {
+            placements: &[],
+            unplaced: &[],
+            standalone: true,
+        },
+    )
+    .bytes)
+}
+
+pub(crate) fn tessellate_placed(model: &BrepModel, request: &MeshRequest<'_>) -> DrawnMesh {
     let mut bodies = Vec::with_capacity(model.bodies.len());
+    let mut faces_approximated = 0u32;
+    let mut faces_omitted = 0u32;
+    let mut truncated = false;
     for (ordinal, body) in model.bodies.iter().enumerate() {
-        bodies.push(tessellate_body(model, body, u32::try_from(ordinal).unwrap_or(u32::MAX))?);
+        let (mesh, tally) = tessellate_body(model, body, u32::try_from(ordinal).unwrap_or(u32::MAX), truncated);
+        faces_approximated = faces_approximated.saturating_add(tally.approximated);
+        faces_omitted = faces_omitted.saturating_add(tally.omitted);
+        truncated |= tally.truncated;
+        bodies.push(mesh);
     }
     let mut out = Vec::new();
     write_u32(&mut out, MAGIC);
@@ -64,22 +97,557 @@ pub(crate) fn tessellate_placed(model: &BrepModel, placements: &[Placement]) -> 
             }
         }
     }
+    write_placements(&mut out, model, request);
+    DrawnMesh {
+        bytes: out,
+        faces_approximated,
+        faces_omitted,
+        bodies_rendered: u32::try_from(bodies.len()).unwrap_or(u32::MAX),
+        bodies_total: u32::try_from(model.bodies.len()).unwrap_or(u32::MAX),
+        truncated,
+    }
+}
+
+pub(crate) struct ViewMesh {
+    pub bytes: Vec<u8>,
+    pub analytic_faces: u32,
+    pub other_faces: u32,
+    pub faces_omitted: u32,
+    pub bodies: u32,
+    pub truncated: bool,
+}
+
+/// Face buffer for the native OCCT mesher. Magic is `PSF2` (`0x32465350`).
+/// Planes, cylinders, cones, spheres, tori, NURBS, offsets, spun surfaces, and
+/// rolling-ball blends carry their definition. Anything else is kind 0 and is
+/// drawn from that face's stitch triangles.
+pub(crate) fn view_scene(model: &BrepModel, request: &MeshRequest<'_>) -> ViewMesh {
+    const VIEW_MAGIC: u32 = 0x3246_5350;
+    let mut out = Vec::new();
+    write_u32(&mut out, VIEW_MAGIC);
+    write_u32(&mut out, 1);
+    write_u32(&mut out, u32::from(model.complete));
+    write_u32(&mut out, u32::try_from(model.bodies.len()).unwrap_or(u32::MAX));
+    let mut stitch = Vec::new();
+    let mut bounds = Bounds::new();
+    let mut analytic_faces = 0u32;
+    let mut other_faces = 0u32;
+    let mut faces_omitted = 0u32;
+    let mut truncated = false;
+    for (ordinal, body) in model.bodies.iter().enumerate() {
+        let ids = face_ids(model, body);
+        write_u32(&mut out, u32::try_from(ordinal).unwrap_or(u32::MAX));
+        write_u32(
+            &mut out,
+            match body.kind {
+                BodyKind::Solid => 1,
+                BodyKind::Wire => 2,
+                BodyKind::Sheet => 3,
+                BodyKind::General => 6,
+            },
+        );
+        write_i32(&mut out, body.source.node_id.unwrap_or(-1));
+        write_u32(&mut out, u32::try_from(ids.len()).unwrap_or(u32::MAX));
+        for face_id in ids {
+            match write_view_face(model, face_id, &mut out, &mut stitch, &mut bounds, &mut truncated) {
+                ViewFace::Analytic => analytic_faces = analytic_faces.saturating_add(1),
+                ViewFace::Other => other_faces = other_faces.saturating_add(1),
+                ViewFace::Omitted => faces_omitted = faces_omitted.saturating_add(1),
+            }
+        }
+    }
+    write_placements(&mut out, model, request);
+    ViewMesh {
+        bytes: out,
+        analytic_faces,
+        other_faces,
+        faces_omitted,
+        bodies: u32::try_from(model.bodies.len()).unwrap_or(u32::MAX),
+        truncated,
+    }
+}
+
+enum ViewFace {
+    Analytic,
+    Other,
+    Omitted,
+}
+
+fn write_view_face(
+    model: &BrepModel,
+    face_id: BrepId,
+    out: &mut Vec<u8>,
+    stitch: &mut Vec<Triangle>,
+    bounds: &mut Bounds,
+    truncated: &mut bool,
+) -> ViewFace {
+    let Some(face) = at(&model.faces, face_id) else {
+        write_u32(out, 0);
+        write_u32(out, 0);
+        for _ in 0..16 {
+            write_f64(out, 0.0);
+        }
+        write_u32(out, 0);
+        write_u32(out, 0);
+        return ViewFace::Omitted;
+    };
+    let surface = face.surface.and_then(|id| at(&model.surfaces, id));
+    let kind = write_face_surface(model, surface, face.sense, out);
+    let mut loops = Vec::new();
+    for loop_id in &face.loops {
+        if let Some(poly) = loop_polyline(model, *loop_id) {
+            loops.push(poly);
+        }
+    }
+    write_u32(out, u32::try_from(loops.len()).unwrap_or(u32::MAX));
+    for poly in &loops {
+        write_u32(out, u32::try_from(poly.len()).unwrap_or(u32::MAX));
+        for point in poly {
+            write_f32(out, point.x as f32);
+            write_f32(out, point.y as f32);
+            write_f32(out, point.z as f32);
+        }
+    }
+    let start = stitch.len();
+    if !*truncated {
+        let mut sink = Sink { triangles: stitch, bounds };
+        if tessellate_face(model, face_id, &mut sink).is_err() {
+            *truncated = true;
+        }
+    }
+    let triangles = &stitch[start..];
+    write_u32(out, u32::try_from(triangles.len()).unwrap_or(u32::MAX));
+    for tri in triangles {
+        for corner in &tri.position {
+            write_f32(out, corner[0]);
+            write_f32(out, corner[1]);
+            write_f32(out, corner[2]);
+        }
+        for normal in &tri.normal {
+            write_f32(out, normal[0]);
+            write_f32(out, normal[1]);
+            write_f32(out, normal[2]);
+        }
+    }
+    if loops.is_empty() {
+        ViewFace::Omitted
+    } else if kind == 0 {
+        ViewFace::Other
+    } else {
+        ViewFace::Analytic
+    }
+}
+
+fn write_blank_surface(out: &mut Vec<u8>) {
+    write_u32(out, 0);
+    write_u32(out, 0);
+    for _ in 0..16 {
+        write_f64(out, 0.0);
+    }
+}
+
+fn write_vec3(out: &mut Vec<u8>, value: Vector3) {
+    write_f64(out, value.x);
+    write_f64(out, value.y);
+    write_f64(out, value.z);
+}
+
+fn pole_xyz(values: &[f64], rational: bool) -> Option<([f64; 3], f64)> {
+    let weight = if rational { *values.get(3)? } else { 1.0 };
+    if values.len() < 3 || !weight.is_finite() || weight.abs() <= 1e-15 {
+        return None;
+    }
+    let point = [values[0] / weight, values[1] / weight, values[2] / weight];
+    (point.iter().all(|item| item.is_finite())).then_some((point, weight))
+}
+
+fn write_knots(out: &mut Vec<u8>, knots: &[f64], multiplicities: &[u16]) -> bool {
+    if knots.is_empty() || knots.len() != multiplicities.len() || knots.len() > 4096 {
+        return false;
+    }
+    for (knot, multiplicity) in knots.iter().zip(multiplicities) {
+        if !knot.is_finite() || *multiplicity == 0 {
+            return false;
+        }
+        write_f64(out, *knot);
+    }
+    for multiplicity in multiplicities {
+        write_u32(out, u32::from(*multiplicity));
+    }
+    true
+}
+
+fn write_nurbs_surface(surface: &NurbsSurface, out: &mut Vec<u8>) -> bool {
+    let u_count = surface.u_control_vertex_count;
+    let v_count = surface.v_control_vertex_count;
+    let poles = u64::from(u_count) * u64::from(v_count);
+    if surface.u_degree == 0
+        || surface.v_degree == 0
+        || u_count < 2
+        || v_count < 2
+        || poles > 65_536
+        || surface.control_vertices.len() != usize::try_from(poles).unwrap_or(usize::MAX)
+    {
+        return false;
+    }
+    let mut body = Vec::new();
+    write_u32(&mut body, u32::from(surface.u_degree));
+    write_u32(&mut body, u32::from(surface.v_degree));
+    write_u32(&mut body, u_count);
+    write_u32(&mut body, v_count);
+    write_u32(&mut body, u32::from(surface.rational));
+    write_u32(&mut body, u32::try_from(surface.u_knots.len()).unwrap_or(u32::MAX));
+    write_u32(&mut body, u32::try_from(surface.v_knots.len()).unwrap_or(u32::MAX));
+        for values in &surface.control_vertices {
+        let Some((point, _)) = pole_xyz(values, surface.rational) else {
+            return false;
+        };
+        for coord in point {
+            write_f64(&mut body, coord);
+        }
+    }
+    for values in &surface.control_vertices {
+        let Some((_, weight)) = pole_xyz(values, surface.rational) else {
+            return false;
+        };
+        write_f64(&mut body, weight);
+    }
+    if !write_knots(&mut body, &surface.u_knots, &surface.u_knot_multiplicities)
+        || !write_knots(&mut body, &surface.v_knots, &surface.v_knot_multiplicities)
+    {
+        return false;
+    }
+    out.extend_from_slice(&body);
+    true
+}
+
+fn write_nurbs_curve(curve: &NurbsCurve, out: &mut Vec<u8>) -> bool {
+    let count = curve.control_vertex_count;
+    if curve.degree == 0
+        || count < 2
+        || count > 8192
+        || curve.control_vertices.len() != usize::try_from(count).unwrap_or(usize::MAX)
+    {
+        return false;
+    }
+    let mut body = Vec::new();
+    write_u32(&mut body, 4);
+    write_u32(&mut body, u32::from(curve.degree));
+    write_u32(&mut body, count);
+    write_u32(&mut body, u32::from(curve.rational));
+    write_u32(&mut body, u32::try_from(curve.knots.len()).unwrap_or(u32::MAX));
+    for values in &curve.control_vertices {
+        let Some((point, _)) = pole_xyz(values, curve.rational) else {
+            return false;
+        };
+        for coord in point {
+            write_f64(&mut body, coord);
+        }
+    }
+    for values in &curve.control_vertices {
+        let Some((_, weight)) = pole_xyz(values, curve.rational) else {
+            return false;
+        };
+        write_f64(&mut body, weight);
+    }
+    if !write_knots(&mut body, &curve.knots, &curve.knot_multiplicities) {
+        return false;
+    }
+    out.extend_from_slice(&body);
+    true
+}
+
+fn write_curve(model: &BrepModel, id: BrepId, out: &mut Vec<u8>, depth: u32) -> bool {
+    if depth > 4 {
+        write_u32(out, 0);
+        return false;
+    }
+    let Some(curve) = at(&model.curves, id) else {
+        write_u32(out, 0);
+        return false;
+    };
+    match &curve.kind {
+        CurveKind::Line { point, direction } => {
+            write_u32(out, 1);
+            write_vec3(out, *point);
+            write_vec3(out, *direction);
+            true
+        }
+        CurveKind::Circle { center, normal, x_axis, radius } if radius.is_finite() && *radius > 1e-12 => {
+            write_u32(out, 2);
+            write_vec3(out, *center);
+            write_vec3(out, *normal);
+            write_vec3(out, *x_axis);
+            write_f64(out, *radius);
+            true
+        }
+        CurveKind::Ellipse { center, normal, x_axis, major_radius, minor_radius }
+            if major_radius.is_finite()
+                && minor_radius.is_finite()
+                && *minor_radius > 1e-12
+                && *major_radius >= *minor_radius =>
+        {
+            write_u32(out, 3);
+            write_vec3(out, *center);
+            write_vec3(out, *normal);
+            write_vec3(out, *x_axis);
+            write_f64(out, *major_radius);
+            write_f64(out, *minor_radius);
+            true
+        }
+        CurveKind::Nurbs(curve) => write_nurbs_curve(curve, out),
+        CurveKind::Trimmed { basis_curve, start_parameter, end_parameter, .. }
+            if start_parameter.is_finite() && end_parameter.is_finite() && start_parameter != end_parameter =>
+        {
+            write_u32(out, 5);
+            write_f64(out, *start_parameter);
+            write_f64(out, *end_parameter);
+            write_curve(model, *basis_curve, out, depth + 1)
+        }
+        _ => {
+            write_u32(out, 0);
+            false
+        }
+    }
+}
+
+fn write_nested_surface(model: &BrepModel, id: BrepId, out: &mut Vec<u8>, depth: u32) -> bool {
+    if depth > 4 {
+        write_u32(out, 0);
+        return false;
+    }
+    let Some(surface) = at(&model.surfaces, id) else {
+        write_u32(out, 0);
+        return false;
+    };
+    let mut extra = Vec::new();
+    let kind = match &surface.kind {
+        SurfaceKind::Plane { .. }
+        | SurfaceKind::Cylinder { .. }
+        | SurfaceKind::Cone { .. }
+        | SurfaceKind::Sphere { .. }
+        | SurfaceKind::Torus { .. } => {
+            let (kind, _sense, param) = surface_record(Some(&surface.kind), Sense::Positive, Sense::Positive);
+            write_u32(out, kind);
+            for value in param {
+                write_f64(out, value);
+            }
+            return kind != 0;
+        }
+        SurfaceKind::Nurbs(nurbs) => u32::from(write_nurbs_surface(nurbs, &mut extra)).saturating_mul(6),
+        SurfaceKind::Offset { basis_surface, offset } if offset.is_finite() => {
+            write_f64(&mut extra, *offset);
+            if write_nested_surface(model, *basis_surface, &mut extra, depth + 1) {
+                7
+            } else {
+                0
+            }
+        }
+        SurfaceKind::Spun { profile, base, axis, start_parameter, end_parameter, .. } => {
+            write_vec3(&mut extra, *base);
+            write_vec3(&mut extra, *axis);
+            let ranged = match (start_parameter, end_parameter) {
+                (None, None) => {
+                    write_u32(&mut extra, 0);
+                    true
+                }
+                (Some(start), Some(end)) if start.is_finite() && end.is_finite() && start != end => {
+                    write_u32(&mut extra, 1);
+                    write_f64(&mut extra, *start);
+                    write_f64(&mut extra, *end);
+                    true
+                }
+                _ => false,
+            };
+            if ranged && write_curve(model, *profile, &mut extra, 0) {
+                8
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    };
+    if kind == 0 {
+        write_u32(out, 0);
+        return false;
+    }
+    if kind >= 6 {
+        write_u32(out, kind);
+        out.extend_from_slice(&extra);
+    }
+    true
+}
+
+fn write_face_surface(model: &BrepModel, surface: Option<&parasolid_core::brep::SurfaceGeometry>, face_sense: Sense, out: &mut Vec<u8>) -> u32 {
+    let Some(surface) = surface else {
+        write_blank_surface(out);
+        return 0;
+    };
+    if matches!(
+        surface.kind,
+        SurfaceKind::Plane { .. }
+            | SurfaceKind::Cylinder { .. }
+            | SurfaceKind::Cone { .. }
+            | SurfaceKind::Sphere { .. }
+            | SurfaceKind::Torus { .. }
+    ) {
+        let (kind, sense, param) = surface_record(Some(&surface.kind), face_sense, surface.sense);
+        write_u32(out, kind);
+        write_u32(out, sense);
+        for value in param {
+            write_f64(out, value);
+        }
+        return kind;
+    }
+    let mut extra = Vec::new();
+    let kind = match &surface.kind {
+        SurfaceKind::Nurbs(nurbs) => {
+            if write_nurbs_surface(nurbs, &mut extra) {
+                6
+            } else {
+                0
+            }
+        }
+        SurfaceKind::Offset { basis_surface, offset } if offset.is_finite() => {
+            write_f64(&mut extra, *offset);
+            if write_nested_surface(model, *basis_surface, &mut extra, 0) {
+                7
+            } else {
+                0
+            }
+        }
+        SurfaceKind::Spun { profile, base, axis, start_parameter, end_parameter, .. } => {
+            write_vec3(&mut extra, *base);
+            write_vec3(&mut extra, *axis);
+            let ranged = match (start_parameter, end_parameter) {
+                (None, None) => {
+                    write_u32(&mut extra, 0);
+                    true
+                }
+                (Some(start), Some(end)) if start.is_finite() && end.is_finite() && start != end => {
+                    write_u32(&mut extra, 1);
+                    write_f64(&mut extra, *start);
+                    write_f64(&mut extra, *end);
+                    true
+                }
+                _ => false,
+            };
+            if ranged && write_curve(model, *profile, &mut extra, 0) {
+                8
+            } else {
+                0
+            }
+        }
+        SurfaceKind::BlendedEdge { blend_type, spine_curve, ranges, thumb_weights, .. } => {
+            let radius = ranges[0].abs();
+            let equal = (radius - ranges[1].abs()).abs() <= 1e-12 * radius.max(1.0);
+            let neutral = (thumb_weights[0] - 1.0).abs() <= 1e-9 && (thumb_weights[1] - 1.0).abs() <= 1e-9;
+            if blend_type.as_str() == "rolling_ball" && radius.is_finite() && radius > 1e-12 && equal && neutral {
+                write_f64(&mut extra, radius);
+                if write_curve(model, *spine_curve, &mut extra, 0) {
+                    9
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    };
+    if kind == 0 {
+        write_blank_surface(out);
+        return 0;
+    }
+    let sense = u32::from((face_sense == Sense::Negative) ^ (surface.sense == Sense::Negative));
+    write_u32(out, kind);
+    write_u32(out, sense);
+    for _ in 0..16 {
+        write_f64(out, 0.0);
+    }
+    out.extend_from_slice(&extra);
+    kind
+}
+
+/// Parameter slots shared with the viewer. Unused slots stay 0.
+/// Plane: point, normal, x axis. Cylinder: point, axis, x axis, radius.
+/// Cone adds sin and cos of the half angle. Sphere: center, radius, axis, x axis.
+/// Torus: center, axis, major radius, minor radius, x axis.
+fn surface_record(kind: Option<&SurfaceKind>, face_sense: Sense, surface_sense: Sense) -> (u32, u32, [f64; 16]) {
+    let reverse = u32::from((face_sense == Sense::Negative) ^ (surface_sense == Sense::Negative));
+    let mut param = [0.0; 16];
+    let code = match kind {
+        Some(SurfaceKind::Plane { point, normal, x_axis }) => {
+            pack_vec(&mut param, 0, *point);
+            pack_vec(&mut param, 3, *normal);
+            pack_vec(&mut param, 6, *x_axis);
+            1
+        }
+        Some(SurfaceKind::Cylinder { point, axis, radius, x_axis }) => {
+            pack_vec(&mut param, 0, *point);
+            pack_vec(&mut param, 3, *axis);
+            pack_vec(&mut param, 6, *x_axis);
+            param[9] = *radius;
+            2
+        }
+        Some(SurfaceKind::Cone { point, axis, radius, sin_half_angle, cos_half_angle, x_axis }) => {
+            pack_vec(&mut param, 0, *point);
+            pack_vec(&mut param, 3, *axis);
+            pack_vec(&mut param, 6, *x_axis);
+            param[9] = *radius;
+            param[10] = *sin_half_angle;
+            param[11] = *cos_half_angle;
+            3
+        }
+        Some(SurfaceKind::Sphere { center, radius, axis, x_axis }) => {
+            pack_vec(&mut param, 0, *center);
+            param[3] = *radius;
+            pack_vec(&mut param, 4, *axis);
+            pack_vec(&mut param, 7, *x_axis);
+            4
+        }
+        Some(SurfaceKind::Torus { center, axis, major_radius, minor_radius, x_axis }) => {
+            pack_vec(&mut param, 0, *center);
+            pack_vec(&mut param, 3, *axis);
+            param[6] = *major_radius;
+            param[7] = *minor_radius;
+            pack_vec(&mut param, 8, *x_axis);
+            5
+        }
+        _ => 0,
+    };
+    (code, reverse, param)
+}
+
+fn pack_vec(param: &mut [f64; 16], at: usize, value: Vector3) {
+    param[at] = value.x;
+    param[at + 1] = value.y;
+    param[at + 2] = value.z;
+}
+
+fn write_placements(out: &mut Vec<u8>, model: &BrepModel, request: &MeshRequest<'_>) {
     let generated;
-    let records = if placements.is_empty() {
+    let records = if request.placements.is_empty() && request.standalone {
         generated = identity_placements(model);
         generated.as_slice()
     } else {
-        placements
+        request.placements
     };
-    write_u32(&mut out, u32::try_from(records.len()).unwrap_or(u32::MAX));
+    write_u32(out, u32::try_from(records.len()).unwrap_or(u32::MAX));
     for record in records {
-        write_u32(&mut out, record.body);
-        write_i32(&mut out, record.node_id);
+        write_u32(out, record.body);
+        write_i32(out, record.node_id);
         for value in record.matrix {
-            write_f32(&mut out, value);
+            write_f32(out, value);
         }
     }
-    Ok(out)
+    if !request.unplaced.is_empty() {
+        write_u32(out, u32::try_from(request.unplaced.len()).unwrap_or(u32::MAX));
+        for item in request.unplaced {
+            write_u32(out, item.body);
+            write_i32(out, item.node_id);
+        }
+    }
 }
 
 fn identity_placements(model: &BrepModel) -> Vec<Placement> {
@@ -161,16 +729,54 @@ impl Bounds {
     }
 }
 
-fn tessellate_body(model: &BrepModel, body: &Body, ordinal: u32) -> Result<BodyMesh, String> {
+struct FaceTally {
+    approximated: u32,
+    omitted: u32,
+    truncated: bool,
+}
+
+fn tessellate_body(model: &BrepModel, body: &Body, ordinal: u32, already_full: bool) -> (BodyMesh, FaceTally) {
     let mut triangles = Vec::new();
     let mut bounds = Bounds::new();
+    let mut tally = FaceTally {
+        approximated: 0,
+        omitted: 0,
+        truncated: already_full,
+    };
     {
         let mut sink = Sink {
             triangles: &mut triangles,
             bounds: &mut bounds,
         };
         for face_id in face_ids(model, body) {
-            tessellate_face(model, face_id, &mut sink)?;
+            if tally.truncated {
+                tally.omitted = tally.omitted.saturating_add(1);
+                continue;
+            }
+            let before = sink.triangles.len();
+            match tessellate_face(model, face_id, &mut sink) {
+                Ok(FaceDraw::Absent) => {}
+                Ok(FaceDraw::Exact) => {
+                    if sink.triangles.len() == before {
+                        tally.omitted = tally.omitted.saturating_add(1);
+                    }
+                }
+                Ok(FaceDraw::Approx) => {
+                    if sink.triangles.len() > before {
+                        tally.approximated = tally.approximated.saturating_add(1);
+                    } else {
+                        tally.omitted = tally.omitted.saturating_add(1);
+                    }
+                }
+                Err(()) => {
+                    if sink.triangles.len() > before {
+                        tally.approximated = tally.approximated.saturating_add(1);
+                    } else {
+                        tally.omitted = tally.omitted.saturating_add(1);
+                    }
+                    tally.truncated = true;
+                }
+            }
         }
         for vertex_id in &body.vertices {
             if let Some(point) = vertex_position(model, *vertex_id) {
@@ -188,7 +794,8 @@ fn tessellate_body(model: &BrepModel, body: &Body, ordinal: u32) -> Result<BodyM
             }
         }
     }
-    Ok(BodyMesh {
+    (
+        BodyMesh {
         ordinal,
         kind: match body.kind {
             BodyKind::Solid => 1,
@@ -199,7 +806,9 @@ fn tessellate_body(model: &BrepModel, body: &Body, ordinal: u32) -> Result<BodyM
         node_id: body.source.node_id.unwrap_or(-1),
         bounds: bounds.pack(),
         triangles,
-    })
+        },
+        tally,
+    )
 }
 
 fn face_ids(model: &BrepModel, body: &Body) -> Vec<BrepId> {
@@ -222,9 +831,15 @@ fn face_ids(model: &BrepModel, body: &Body) -> Vec<BrepId> {
     ids
 }
 
-fn tessellate_face(model: &BrepModel, face_id: BrepId, sink: &mut Sink<'_>) -> Result<(), String> {
+enum FaceDraw {
+    Absent,
+    Exact,
+    Approx,
+}
+
+fn tessellate_face(model: &BrepModel, face_id: BrepId, sink: &mut Sink<'_>) -> Result<FaceDraw, ()> {
     let Some(face) = at(&model.faces, face_id) else {
-        return Ok(());
+        return Ok(FaceDraw::Absent);
     };
     let mut loops = Vec::new();
     for loop_id in &face.loops {
@@ -235,7 +850,7 @@ fn tessellate_face(model: &BrepModel, face_id: BrepId, sink: &mut Sink<'_>) -> R
         }
     }
     if loops.is_empty() {
-        return Ok(());
+        return Ok(FaceDraw::Exact);
     }
     let surface = face.surface.and_then(|id| at(&model.surfaces, id));
     let sense = sense_sign(face.sense) * surface.map_or(1.0, |item| sense_sign(item.sense));
@@ -253,16 +868,24 @@ fn tessellate_face(model: &BrepModel, face_id: BrepId, sink: &mut Sink<'_>) -> R
                 kind,
                 sink,
             )
+            .map(|()| FaceDraw::Exact)
+            .map_err(|_| ())
         }
         Some(SurfaceKind::Sphere { center, radius, .. }) if loops.len() == 1 && *radius > 0.0 => {
             sphere_cap(&loops[0], *center, *radius, sense, sink)
+                .map(|()| FaceDraw::Approx)
+                .map_err(|_| ())
         }
-        _ if loops.len() >= 2 => stitch_loops(&loops[0], &loops[1], kind, sense, sink),
+        _ if loops.len() >= 2 => stitch_loops(&loops[0], &loops[1], kind, sense, sink)
+            .map(|()| FaceDraw::Approx)
+            .map_err(|_| ()),
         _ => {
             let normal = kind
                 .and_then(|item| surface_normal(item, sense, loops[0][0]))
                 .unwrap_or_else(|| polygon_normal(&loops[0]));
             triangulate_polygon(&loops[0], normal, 1.0, kind, sink)
+                .map(|()| FaceDraw::Approx)
+                .map_err(|_| ())
         }
     }
 }
@@ -369,9 +992,12 @@ fn sample_ellipse(frame_in: &EllipseFrame, from: Option<Vector3>, to: Option<Vec
     if major.abs() < 1e-12 || minor.abs() < 1e-12 {
         return from.into_iter().collect();
     }
+    // The ellipse parameter is atan2(y / minor, x / major). A circle cancels
+    // the common radius. A flat ellipse does not: raw atan2(y, x) walks off
+    // along the major axis and drags one sample to the far tip.
     let angle_of = |point: Vector3| -> f64 {
         let delta = sub(point, center);
-        delta.dot_axis(frame.1).atan2(delta.dot_axis(frame.0))
+        (delta.dot_axis(frame.1) / minor).atan2(delta.dot_axis(frame.0) / major)
     };
     let full = match (from, to) {
         (Some(start), Some(end)) => near(start, end),
@@ -402,11 +1028,17 @@ fn sample_ellipse(frame_in: &EllipseFrame, from: Option<Vector3>, to: Option<Vec
             add(scale(frame.0, major * angle.cos()), scale(frame.1, minor * angle.sin())),
         ));
     }
-    if let Some(start_point) = from
-        && !full
-        && let Some(first) = points.first_mut()
-    {
-        *first = start_point;
+    if !full {
+        if let Some(start_point) = from
+            && let Some(first) = points.first_mut()
+        {
+            *first = start_point;
+        }
+        if let Some(end_point) = to
+            && let Some(last) = points.last_mut()
+        {
+            *last = end_point;
+        }
     }
     points
 }
@@ -1154,6 +1786,10 @@ fn write_f32(out: &mut Vec<u8>, value: f32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
+fn write_f64(out: &mut Vec<u8>, value: f64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::tessellate;
@@ -1360,5 +1996,17 @@ mod tests {
         assert!(bytes.len() > 16);
         let triangles = u32::from_le_bytes(bytes[28..32].try_into().unwrap_or([0; 4]));
         assert_eq!(triangles, 12);
+        let view = super::view_scene(
+            &model,
+            &super::MeshRequest { placements: &[], unplaced: &[], standalone: true },
+        );
+        assert_eq!(view.analytic_faces, 6);
+        assert_eq!(view.other_faces, 0);
+        let mut magic = [0u8; 4];
+        magic.copy_from_slice(&view.bytes[..4]);
+        assert_eq!(u32::from_le_bytes(magic), 0x3246_5350);
+        let mut kind = [0u8; 4];
+        kind.copy_from_slice(&view.bytes[32..36]);
+        assert_eq!(u32::from_le_bytes(kind), 1);
     }
 }

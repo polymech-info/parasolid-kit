@@ -11,7 +11,7 @@
 # The INTERFACE target `parasolid` carries the header and the import library.
 # The DLL path is the target property PARASOLID_DLL.
 #
-# The library inspects and parses X_T / X_B files. It does not emit a mesh.
+# The library inspects and parses X_T / X_B files and emits the viewer buffers.
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     cmake_minimum_required(VERSION 3.20)

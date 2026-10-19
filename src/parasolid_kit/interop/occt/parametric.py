@@ -206,8 +206,15 @@ class ParametricTopologyBuilder(TopologyBuilder):
 
     def build(self) -> BuiltTopology:
         self._build_vertices()
+        # A bad edge must not discard every face. The document still does not
+        # assemble: the edge is recorded and RefusedFaces is raised below.
+        refused_edges: list[Diagnostic] = []
         for edge in self.model.edges:
-            self._build_edge(edge)
+            try:
+                self._build_edge(edge)
+            except Exception as error:
+                self.edge_shapes.pop(edge.id, None)
+                refused_edges.append(self._refused_edge_diagnostic(edge, error))
         # All face pcurves must exist before a periodic seam splits shared rings.
         # A refused face is recorded and skipped. Shared edges can make a later
         # face fail because an earlier one did; the messages stay per face.
@@ -246,12 +253,12 @@ class ParametricTopologyBuilder(TopologyBuilder):
             except Exception as error:
                 refused[face.id] = error
                 self.face_shapes.pop(face.id, None)
-        if refused:
+        if refused or refused_edges:
             findings = tuple(
                 self._refused_face_diagnostic(face, refused[face.id])
                 for face in self.model.faces
                 if face.id in refused
-            )
+            ) + tuple(refused_edges)
             self.diagnostics.extend(findings)
             raise RefusedFaces(findings)
         self._validate_source_boundaries()
@@ -1049,6 +1056,25 @@ class ParametricTopologyBuilder(TopologyBuilder):
         builder.Add(wire, edge)
         self.loop_shapes[loop.id] = wire
         return wire
+
+    def _refused_edge_diagnostic(self, edge, error: Exception) -> Diagnostic:
+        node_id = edge.source.node_id
+        return Diagnostic(
+            code="occt.edge_refused",
+            severity=DiagnosticSeverity.ERROR,
+            kind=DiagnosticKind.INVALID,
+            fatal=True,
+            message=f"edge {edge.id} was not converted: {error}",
+            location=SourceLocation(byte_offset=edge.source.byte_range.start),
+            node_type=edge.source.node_type,
+            node_id=None if node_id is None or node_id < 0 else node_id,
+            schema_key=self.model.schema_key,
+            details={
+                "entity_kind": "edge",
+                "entity_id": edge.id,
+                "exception_type": type(error).__name__,
+            },
+        )
 
     def _refused_face_diagnostic(self, face, error: Exception) -> Diagnostic:
         surface = self.surfaces.get(face.surface)

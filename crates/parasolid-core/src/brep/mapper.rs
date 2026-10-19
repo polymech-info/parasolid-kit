@@ -643,7 +643,9 @@ impl<'a> Mapper<'a> {
             supporting_surfaces,
             spine_curve: self.required_id(node, "spine", "curve geometry", &self.ids.curves)?,
             ranges: self.double_pair(node, "range")?,
-            thumb_weights: self.double_pair(node, "thumb_weight")?,
+            // Rolling-ball blends transmit unset thumb weights as null. 1 is the
+            // neutral weight; a present non-finite value is still rejected.
+            thumb_weights: self.double_pair_default(node, "thumb_weight", 1.0)?,
             boundary_surfaces,
             start: self.optional_source(node, "start")?,
             end: self.optional_source(node, "end")?,
@@ -1940,6 +1942,31 @@ impl<'a> Mapper<'a> {
         Ok([values[0], values[1]])
     }
 
+    fn double_pair_default(
+        &self,
+        node: &RawNode,
+        field: &'static str,
+        missing: f64,
+    ) -> Result<[f64; 2], ParseError> {
+        let values = &self.field(node, field)?.values;
+        self.validate_count(node, field, 2, values.len())?;
+        let mut pair = [missing, missing];
+        for (index, value) in values.iter().take(2).enumerate() {
+            match value {
+                FieldValue::Double(None) => {}
+                FieldValue::Double(Some(item)) if item.is_finite() => pair[index] = *item,
+                _ => {
+                    return Err(self.invalid_geometry(
+                        node,
+                        field,
+                        "double pair contains non-finite data",
+                    ));
+                }
+            }
+        }
+        Ok(pair)
+    }
+
     fn double_array(&self, node: &RawNode, field: &'static str) -> Result<Vec<f64>, ParseError> {
         self.field(node, field)?
             .values
@@ -3018,6 +3045,56 @@ mod tests {
                 }
             ));
         }
+        let unset = {
+            let mut fields = common_surface_fields(0);
+            fields.extend([
+                field("blend_type", 0, vec![FieldValue::Character(b'R')]),
+                field(
+                    "surface",
+                    1006,
+                    vec![FieldValue::PointerIndex(1), FieldValue::PointerIndex(2)],
+                ),
+                field("spine", 1008, vec![FieldValue::PointerIndex(3)]),
+                field(
+                    "range",
+                    0,
+                    vec![FieldValue::Double(Some(0.005)), FieldValue::Double(Some(0.005))],
+                ),
+                field(
+                    "thumb_weight",
+                    0,
+                    vec![FieldValue::Double(None), FieldValue::Double(None)],
+                ),
+                field(
+                    "boundary",
+                    1006,
+                    vec![FieldValue::PointerIndex(0), FieldValue::PointerIndex(0)],
+                ),
+                field("start", 41, vec![FieldValue::PointerIndex(0)]),
+                field("end", 41, vec![FieldValue::PointerIndex(0)]),
+            ]);
+            let unset_nodes = [
+                node(1, 50, "PLANE", common_surface_fields(4)),
+                node(2, 50, "PLANE", common_surface_fields(4)),
+                node(3, 30, "LINE", common_curve_fields(4)),
+                node(4, 56, "BLENDED_EDGE", fields),
+            ];
+            let mut unset_mapper = Mapper::new(
+                BrepSourceFormat::Binary,
+                "SCH_TEST",
+                &unset_nodes,
+                RoleAccess::Named,
+            );
+            unset_mapper.map_surface(4)
+        };
+        assert!(matches!(
+            unset.as_ref().map(|surface| &surface.kind),
+            Ok(SurfaceKind::BlendedEdge {
+                thumb_weights: [1.0, 1.0],
+                ..
+            })
+        ));
+
         let boundary = mapper.map_surface(5);
         assert!(boundary.is_ok());
         if let Ok(boundary) = boundary {

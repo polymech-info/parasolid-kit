@@ -11,19 +11,19 @@ import sys
 from math import sqrt
 from pathlib import Path
 
-from OCP.BRep import BRep_Tool
+from OCP.BRep import BRep_Builder, BRep_Tool
 from OCP.BRepBndLib import BRepBndLib
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.Bnd import Bnd_Box
 from OCP.IMeshTools import IMeshTools_Parameters
 from OCP.TopAbs import TopAbs_FACE, TopAbs_REVERSED
 from OCP.TopExp import TopExp_Explorer
-from OCP.TopoDS import TopoDS
+from OCP.TopoDS import TopoDS, TopoDS_Compound
 
 from ...brep.topology import BodyKind
 from .geometry import GeometryFactory
 from .options import UNIT_TO_METRES, LengthUnit, OcctConversionOptions, mesh_deflection
-from .parametric import ParametricTopologyBuilder
+from .parametric import ParametricTopologyBuilder, RefusedFaces
 
 MAGIC = 0x314D5350
 ANGLE = 12.0 * 3.141592653589793 / 180.0
@@ -99,6 +99,33 @@ def _kind_code(body, open_shell: bool) -> int:
     return 1
 
 
+def _converted_faces(builder) -> dict:
+    """Mesh faces that converted when assembly stopped on a refused face.
+
+    The missing face is left out. Faces are not sewn, and solid validation is
+    unchanged: ``build`` still refuses the document.
+    """
+
+    rendered = {}
+    for body in builder.model.bodies:
+        compound = TopoDS_Compound()
+        maker = BRep_Builder()
+        maker.MakeCompound(compound)
+        missing = False
+        for region_id in body.regions:
+            region = builder.regions[region_id]
+            for shell_id in region.shells:
+                shell = builder.shells[shell_id]
+                for face_id in (*shell.back_faces, *shell.front_faces):
+                    shape = builder.face_shapes.get(face_id)
+                    if shape is None:
+                        missing = True
+                        continue
+                    maker.Add(compound, shape)
+        rendered[body.id] = (compound, missing)
+    return rendered
+
+
 def scene_mesh_bytes(model, *, source_unit: LengthUnit = "m") -> bytes:
     """OCCT triangles for each body, in source units. The instance trailer is empty.
 
@@ -109,9 +136,17 @@ def scene_mesh_bytes(model, *, source_unit: LengthUnit = "m") -> bytes:
 
     options = OcctConversionOptions(source_unit=source_unit, target_unit="mm")
     builder = ParametricTopologyBuilder(model, GeometryFactory(options))
-    builder.build()
+    try:
+        builder.build()
+    except RefusedFaces as refused:
+        for item in refused.face_diagnostics:
+            print(item.message, file=sys.stderr)
+        rendered = _converted_faces(builder)
+    else:
+        rendered = {
+            body_id: (shape, open_shell) for body_id, shape, open_shell in builder.rendered_bodies
+        }
     to_source = UNIT_TO_METRES["mm"] / UNIT_TO_METRES[source_unit]
-    rendered = {body_id: (shape, open_shell) for body_id, shape, open_shell in builder.rendered_bodies}
     out = bytearray()
 
     def u32(value: int) -> None:
